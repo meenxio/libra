@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 use crate::{cluster::Cluster, instance::Instance};
 use admission_control_proto::proto::admission_control::{
     AdmissionControlClient, SubmitTransactionRequest,
@@ -51,6 +53,7 @@ use std::thread::JoinHandle;
 
 const MAX_TXN_BATCH_SIZE: usize = 100; // Max transactions per account in mempool
 
+#[derive(Clone)]
 pub struct TxEmitter {
     accounts: Vec<AccountData>,
     mint_file: String,
@@ -146,7 +149,7 @@ impl TxEmitter {
         let mut mint_failures = 0;
         info!("Minting accounts on {}", mint_client);
         let retry_mint = env::var_os("NO_MINT_RETRY").is_none();
-        let mut faucet_account = load_faucet_account(&mint_client, &self.mint_file);
+        let mut faucet_account = load_faucet_account(&mint_client, &self.mint_file)?;
         while self.accounts.len() < num_accounts {
             let mut accounts = gen_random_accounts(MAX_TXN_BATCH_SIZE);
             let mint_requests = gen_mint_txn_requests(&mut faucet_account, &accounts);
@@ -186,6 +189,21 @@ impl TxEmitter {
         let env_builder = Arc::new(EnvBuilder::new().name_prefix("ac-grpc-").build());
         let ch = ChannelBuilder::new(env_builder).connect(&address);
         AdmissionControlClient::new(ch)
+    }
+
+    pub fn emit_txn_for(
+        &mut self,
+        duration: Duration,
+        instances: Vec<Instance>,
+    ) -> failure::Result<()> {
+        let job = self.start_job(EmitJobRequest {
+            instances,
+            accounts_per_client: 10,
+            thread_params: EmitThreadParams::default(),
+        })?;
+        thread::sleep(duration);
+        self.stop_job(job);
+        Ok(())
     }
 }
 
@@ -433,19 +451,28 @@ fn execute_and_wait_transactions(
     r
 }
 
-fn load_faucet_account(client: &AdmissionControlClient, faucet_account_path: &str) -> AccountData {
+fn load_faucet_account(
+    client: &NamedAdmissionControlClient,
+    faucet_account_path: &str,
+) -> failure::Result<AccountData> {
     let key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey> =
         load_key_from_file(faucet_account_path).expect("invalid faucet keypair file");
     let address = association_address();
-    let sequence_number = query_sequence_numbers(client, &[address])
-        .expect("query_sequence_numbers for faucet account failed")[0];
-    AccountData {
+    let sequence_number = query_sequence_numbers(client, &[address]).map_err(|e| {
+        format_err!(
+            "query_sequence_numbers on {} for faucet account failed: {}",
+            client,
+            e
+        )
+    })?[0];
+    Ok(AccountData {
         address,
         key_pair,
         sequence_number,
-    }
+    })
 }
 
+#[derive(Clone)]
 struct AccountData {
     pub address: AccountAddress,
     pub key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,

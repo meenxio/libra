@@ -3,6 +3,7 @@
 
 use crate::{
     admission_control_service::AdmissionControlService,
+    counters,
     upstream_proxy::{process_network_messages, UpstreamProxyData},
 };
 use admission_control_proto::proto::admission_control::create_admission_control;
@@ -73,17 +74,20 @@ impl AdmissionControlRuntime {
             .expect("Unable to create grpc server");
 
         let upstream_proxy_runtime = Builder::new()
-            .name_prefix("ac-upstream-proxy-")
+            .thread_name("ac-upstream-proxy-")
+            .threaded_scheduler()
+            .enable_all()
             .build()
             .expect("[admission control] failed to create runtime");
 
-        let executor = upstream_proxy_runtime.executor();
+        let executor = upstream_proxy_runtime.handle();
 
         let upstream_peer_ids = config.get_upstream_peer_ids();
         let peer_info: HashMap<_, _> = upstream_peer_ids
             .iter()
             .map(|peer_id| (*peer_id, true))
             .collect();
+        counters::UPSTREAM_PEERS.set(upstream_peer_ids.len() as i64);
 
         let upstream_proxy_data = UpstreamProxyData::new(
             config.admission_control.clone(),

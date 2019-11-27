@@ -1,7 +1,11 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
+
+#![forbid(unsafe_code)]
+
 use crate::block_info::{BlockInfo, Round};
-use crate::transaction::Transaction;
+use crate::event::EVENT_KEY_LENGTH;
+use crate::transaction::{ChangeSet, Transaction};
 use crate::validator_set::ValidatorSet;
 use crate::{
     access_path::AccessPath,
@@ -311,7 +315,7 @@ fn new_raw_transaction(
         TransactionPayload::WriteSet(write_set) => {
             // It's a bit unfortunate that max_gas_amount etc is generated but
             // not used, but it isn't a huge deal.
-            RawTransaction::new_write_set(sender, sequence_number, write_set)
+            RawTransaction::new_change_set(sender, sequence_number, write_set)
         }
     }
 }
@@ -422,12 +426,13 @@ impl TransactionPayload {
     }
 
     pub fn write_set_strategy() -> impl Strategy<Value = Self> {
-        any::<WriteSet>().prop_map(TransactionPayload::WriteSet)
+        any::<WriteSet>().prop_map(|ws| TransactionPayload::WriteSet(ChangeSet::new(ws, vec![])))
     }
 
     /// Similar to `write_set_strategy` except generates a valid write set for the genesis block.
     pub fn genesis_strategy() -> impl Strategy<Value = Self> {
-        WriteSet::genesis_strategy().prop_map(TransactionPayload::WriteSet)
+        WriteSet::genesis_strategy()
+            .prop_map(|ws| TransactionPayload::WriteSet(ChangeSet::new(ws, vec![])))
     }
 }
 
@@ -642,6 +647,7 @@ impl AccountResourceGen {
             self.delegated_withdrawal_capability,
             account_info.sent_event_handle.clone(),
             account_info.received_event_handle.clone(),
+            0,
         )
     }
 }
@@ -661,6 +667,22 @@ impl AccountStateBlobGen {
             .account_resource_gen
             .materialize(account_index, universe);
         AccountStateBlob::from(account_resource)
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+impl Arbitrary for EventKey {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        (vec(any::<u8>(), EVENT_KEY_LENGTH))
+            .prop_map(|v| {
+                let mut bytes = [0; EVENT_KEY_LENGTH];
+                bytes.copy_from_slice(v.as_slice());
+                EventKey::new(bytes)
+            })
+            .boxed()
     }
 }
 

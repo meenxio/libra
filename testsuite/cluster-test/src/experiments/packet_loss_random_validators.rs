@@ -1,6 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
+use std::{fmt, thread, time::Duration};
+
+use structopt::StructOpt;
+
+use failure;
+
+use crate::experiments::Context;
 /// This module provides an experiment which introduces packet loss for
 /// a given number of instances in the cluster. It undoes the packet loss
 /// in the cluster after the given duration
@@ -10,8 +19,6 @@ use crate::{
     experiments::Experiment,
     instance::Instance,
 };
-use failure;
-use std::{collections::HashSet, fmt, thread, time::Duration};
 
 pub struct PacketLossRandomValidators {
     instances: Vec<Instance>,
@@ -19,27 +26,46 @@ pub struct PacketLossRandomValidators {
     duration: Duration,
 }
 
+#[derive(StructOpt, Debug)]
+pub struct PacketLossRandomValidatorsParams {
+    #[structopt(
+        long,
+        default_value = "10",
+        help = "Percent of instances in which packet loss should be introduced"
+    )]
+    percent_instances: f32,
+    #[structopt(
+        long,
+        default_value = "10",
+        help = "Percent of packet loss for each instance"
+    )]
+    packet_loss_percent: f32,
+    #[structopt(
+        long,
+        default_value = "60",
+        help = "Duration in secs for which packet loss happens"
+    )]
+    duration_secs: u64,
+}
+
 impl PacketLossRandomValidators {
-    pub fn new(count: usize, percent: f32, duration: Duration, cluster: &Cluster) -> Self {
-        let (test_cluster, _) = cluster.split_n_random(count);
+    pub fn new(params: PacketLossRandomValidatorsParams, cluster: &Cluster) -> Self {
+        let total_instances = cluster.instances().len();
+        let packet_loss_num_instances: usize = std::cmp::min(
+            ((params.percent_instances / 100.0) * total_instances as f32).ceil() as usize,
+            total_instances,
+        );
+        let (test_cluster, _) = cluster.split_n_random(packet_loss_num_instances);
         Self {
             instances: test_cluster.into_instances(),
-            percent,
-            duration,
+            percent: params.packet_loss_percent,
+            duration: Duration::from_secs(params.duration_secs),
         }
     }
 }
 
 impl Experiment for PacketLossRandomValidators {
-    fn affected_validators(&self) -> HashSet<String> {
-        let mut r = HashSet::new();
-        for instance in self.instances.iter() {
-            r.insert(instance.short_hash().clone());
-        }
-        r
-    }
-
-    fn run(&self) -> failure::Result<()> {
+    fn run(&mut self, _context: &mut Context) -> failure::Result<Option<String>> {
         let mut instances = vec![];
         for instance in self.instances.iter() {
             let packet_loss = PacketLoss::new(instance.clone(), self.percent);
@@ -51,7 +77,7 @@ impl Experiment for PacketLossRandomValidators {
             let remove_network_effects = RemoveNetworkEffects::new(instance.clone());
             remove_network_effects.apply()?;
         }
-        Ok(())
+        Ok(None)
     }
 
     fn deadline(&self) -> Duration {

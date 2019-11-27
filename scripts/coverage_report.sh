@@ -84,7 +84,9 @@ echo "Cleaning project..."
 echo "Running tests..."
 while read -r line; do
         dirline=$(realpath $(dirname "$line"));
-        (cd "$dirline" && pwd && cargo xtest)
+        # Don't fail out of the loop here. We just want to run the test binary
+        # to collect its profile data.
+        (cd "$dirline" && pwd && cargo xtest || true)
 done < <(find "$TEST_DIR" -name 'Cargo.toml')
 
 # Make the coverage directory if it doesn't exist
@@ -94,7 +96,7 @@ fi
 
 # Generate lcov report
 echo "Generating lcov report at ${COVERAGE_DIR}/lcov.info..."
-grcov target -t lcov  --llvm --branch --ignore "/*" -o "$COVERAGE_DIR/lcov.info"
+grcov target -t lcov  --llvm --branch --ignore "/*" --ignore "x/*" --ignore "testsuite/*" -o "$COVERAGE_DIR/lcov.info"
 
 # Generate HTML report
 echo "Generating report at ${COVERAGE_DIR}..."

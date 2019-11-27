@@ -222,10 +222,7 @@ fn typing_error<T: Into<String>, F: FnOnce() -> T>(
             ),
             (
                 t2.loc,
-                format!(
-                    "Is is not compatible with: '{}'",
-                    t2.value.subst_format(subst)
-                ),
+                format!("Is not compatible with: '{}'", t2.value.subst_format(subst)),
             ),
         ],
         RecursiveType(rloc) => vec![
@@ -546,9 +543,12 @@ fn exp_(context: &mut Context, sp!(eloc, ne_): N::Exp) -> T::Exp {
         }
 
         NE::MethodCall(ndotted, f, ty_args_opt, nargs) => {
-            let (edotted, last_ty) = exp_dotted(context, "method call", false, ndotted);
-            let args = exp_(context, *nargs);
-            let ty_call_opt = method_call(context, eloc, edotted, last_ty, f, ty_args_opt, args);
+            let ty_call_opt = exp_dotted(context, "method call", false, ndotted).and_then(
+                |(edotted, last_ty)| {
+                    let args = exp_(context, *nargs);
+                    method_call(context, eloc, edotted, last_ty, f, ty_args_opt, args)
+                },
+            );
             match ty_call_opt {
                 None => {
                     assert!(context.has_errors());
@@ -633,10 +633,17 @@ fn exp_(context: &mut Context, sp!(eloc, ne_): N::Exp) -> T::Exp {
             let mut rvalue_tys = checked_rvalue_tys(context, eloc, "mutation", 1, er.ty.clone());
             assert!(rvalue_tys.len() == 1);
             let rvalue_ty = rvalue_tys.pop().unwrap();
-            let edotted = exp_dotted(context, "mutation", true, ndotted).0;
-            let eborrow = exp_dotted_to_borrow(context, true, edotted);
-            check_mutation(context, eborrow.exp.loc, eborrow.ty.clone(), rvalue_ty);
-            (sp(eloc, Type_::Unit), TE::Mutate(Box::new(eborrow), er))
+            match exp_dotted(context, "mutation", true, ndotted) {
+                None => {
+                    assert!(context.has_errors());
+                    (Type_::anything(eloc), TE::UnresolvedError)
+                }
+                Some((edotted, _)) => {
+                    let eborrow = exp_dotted_to_borrow(context, eloc, true, edotted);
+                    check_mutation(context, eborrow.exp.loc, eborrow.ty.clone(), rvalue_ty);
+                    (sp(eloc, Type_::Unit), TE::Mutate(Box::new(eborrow), er))
+                }
+            }
         }
 
         NE::Return(nret) => {
@@ -835,20 +842,52 @@ fn exp_(context: &mut Context, sp!(eloc, ne_): N::Exp) -> T::Exp {
             (Type_::base(bt), TE::Pack(m, n, targs, tfields))
         }
 
-        NE::Borrow(mut_, ndotted) => {
-            let edotted = exp_dotted(context, "borrow", true, ndotted).0;
-            let eborrow = exp_dotted_to_borrow(context, mut_, edotted);
-            (eborrow.ty, eborrow.exp.value)
+        NE::Borrow(mut_, sp!(_, N::ExpDotted_::Exp(ner))) => {
+            let er = exp_(context, *ner);
+            let inner = match &er.ty {
+                sp!(_, Type_::Single(sp!(_, SingleType_::Base(b)))) => b.clone(),
+                sp!(tloc, t) => {
+                    // TODO we could just collapse this so &&x == &x
+                    let s = t.subst_format(&context.subst);
+                    let tmsg = format!("Expected a single non-reference type, but got: {}", s);
+                    context.error(vec![(eloc, "Invalid borrow".into()), (*tloc, tmsg)]);
+                    BaseType_::anything(eloc)
+                }
+            };
+            let ty = Type_::single(sp(eloc, SingleType_::Ref(mut_, inner)));
+            let eborrow = match er.exp {
+                sp!(_, TE::Use(v)) => TE::BorrowLocal(mut_, v),
+                erexp => TE::TempBorrow(mut_, Box::new(T::exp(er.ty, erexp))),
+            };
+            (ty, eborrow)
         }
+
+        NE::Borrow(mut_, ndotted) => match exp_dotted(context, "borrow", true, ndotted) {
+            None => {
+                assert!(context.has_errors());
+                (Type_::anything(eloc), TE::UnresolvedError)
+            }
+            Some((edotted, _)) => {
+                let eborrow = exp_dotted_to_borrow(context, eloc, mut_, edotted);
+                (eborrow.ty, eborrow.exp.value)
+            }
+        },
 
         NE::DerefBorrow(ndotted) => {
             assert!(match ndotted {
                 sp!(_, N::ExpDotted_::Exp(_)) => false,
                 _ => true,
             });
-            let (edotted, inner_ty) = exp_dotted(context, "dot access", true, ndotted);
-            let ederefborrow = exp_dotted_to_owned_value(context, edotted, inner_ty);
-            (ederefborrow.ty, ederefborrow.exp.value)
+            match exp_dotted(context, "dot access", true, ndotted) {
+                None => {
+                    assert!(context.has_errors());
+                    (Type_::anything(eloc), TE::UnresolvedError)
+                }
+                Some((edotted, inner_ty)) => {
+                    let ederefborrow = exp_dotted_to_owned_value(context, eloc, edotted, inner_ty);
+                    (ederefborrow.ty, ederefborrow.exp.value)
+                }
+            }
         }
 
         NE::Annotate(nl, ty_annot) => {
@@ -1173,15 +1212,21 @@ fn assign_list(
     let num_assigns = nassigns.len();
     let tys = checked_rvalue_tys(context, loc, "list-assignment", num_assigns, rvalue_ty);
     assert!(tys.len() == num_assigns);
+    let mut assigned: UniqueMap<Var, ()> = UniqueMap::new();
     let tassigns = nassigns
         .into_iter()
         .zip(tys)
-        .map(|(a, t)| assign(context, a, t))
+        .map(|(a, t)| assign(context, &mut assigned, a, t))
         .collect();
     sp(loc, tassigns)
 }
 
-fn assign(context: &mut Context, sp!(aloc, na_): N::Assign, rvalue_ty: SingleType) -> T::Assign {
+fn assign(
+    context: &mut Context,
+    assigned: &mut UniqueMap<Var, ()>,
+    sp!(aloc, na_): N::Assign,
+    rvalue_ty: SingleType,
+) -> T::Assign {
     use N::Assign_ as NA;
     use T::Assign_ as TA;
     let ta_ = match na_ {
@@ -1214,6 +1259,15 @@ fn assign(context: &mut Context, sp!(aloc, na_): N::Assign, rvalue_ty: SingleTyp
                     &var_ty,
                 ),
             };
+            if let Err(prev_loc) = assigned.add(var.clone(), ()) {
+                context.error(vec![
+                    (
+                        var.loc(),
+                        format!("Duplicate usage of local '{}' in a given assignment", &var),
+                    ),
+                    (prev_loc, "Previously assigned here".into()),
+                ]);
+            }
             TA::Var(var, vty)
         }
 
@@ -1250,7 +1304,7 @@ fn assign(context: &mut Context, sp!(aloc, na_): N::Assign, rvalue_ty: SingleTyp
                     None => SingleType_::base(fty.clone()),
                     Some(mut_) => sp(aloc, SingleType_::Ref(mut_, fty.clone())),
                 };
-                let tb = assign(context, na, fixed_fty);
+                let tb = assign(context, assigned, na, fixed_fty);
                 (idx, (fty, tb))
             });
             if &m != current_module {
@@ -1436,7 +1490,7 @@ fn exp_dotted(
     verb: &str,
     borrow_root: bool,
     sp!(dloc, ndot_): N::ExpDotted,
-) -> (ExpDotted, BaseType) {
+) -> Option<(ExpDotted, BaseType)> {
     use N::ExpDotted_ as NE;
     let (edot_, bt) = match ndot_ {
         NE::Exp(ne) => {
@@ -1450,7 +1504,7 @@ fn exp_dotted(
                         (e.exp.loc, format!("Invalid {}. Expected an expression of a single type but got an expression of type: '{}'", verb, subst_t)),
                         (*tloc, "Type found here".into()),
                     ]);
-                    (false, BaseType_::anything(*tloc))
+                    return None;
                 }
                 sp!(_, Single(t @ sp!(_, Ref(_, _)))) => {
                     let inner = sp(dloc, BaseType_::Var(TVar::next()));
@@ -1474,7 +1528,7 @@ fn exp_dotted(
             (edot_, bt)
         }
         NE::Dot(nlhs, field) => {
-            let (lhs, inner) = exp_dotted(context, "dot access", true, *nlhs);
+            let (lhs, inner) = exp_dotted(context, "dot access", true, *nlhs)?;
             let field_ty = resolve_field(context, dloc, inner, &field);
             (
                 ExpDotted_::Dot(Box::new(lhs), field, Box::new(field_ty.clone())),
@@ -1482,10 +1536,15 @@ fn exp_dotted(
             )
         }
     };
-    (sp(dloc, edot_), bt)
+    Some((sp(dloc, edot_), bt))
 }
 
-fn exp_dotted_to_borrow(context: &mut Context, mut_: bool, sp!(loc, dot_): ExpDotted) -> T::Exp {
+fn exp_dotted_to_borrow(
+    context: &mut Context,
+    eloc: Loc,
+    mut_: bool,
+    sp!(loc, dot_): ExpDotted,
+) -> T::Exp {
     use SingleType_ as S;
     use T::UnannotatedExp_ as TE;
     match dot_ {
@@ -1505,11 +1564,11 @@ fn exp_dotted_to_borrow(context: &mut Context, mut_: bool, sp!(loc, dot_): ExpDo
                     TE::TempBorrow(mut_, Box::new(T::exp(eb_ty, sp(ebloc, eb_))))
                 }
             };
-            let ty = Type_::single(sp(loc, SingleType_::Ref(mut_, *bt)));
+            let ty = Type_::single(sp(eloc, SingleType_::Ref(mut_, *bt)));
             T::exp(ty, sp(loc, e_))
         }
         ExpDotted_::Dot(lhs, field, field_ty) => {
-            let lhs_borrow = exp_dotted_to_borrow(context, mut_, *lhs);
+            let lhs_borrow = exp_dotted_to_borrow(context, eloc, mut_, *lhs);
             let lhs_mut = match &lhs_borrow.ty.value {
                 Type_::Single(sp!(_, S::Ref(lhs_mut, _))) => *lhs_mut,
                 _ => panic!("ICE expected a ref from exp_dotted borrow, otherwise should have gotten a TmpBorrow"),
@@ -1517,18 +1576,23 @@ fn exp_dotted_to_borrow(context: &mut Context, mut_: bool, sp!(loc, dot_): ExpDo
             // lhs is immutable and current borrow is mutable
             if !lhs_mut && mut_ {
                 context.error(vec![
-                    (loc, "Invalid mutable borrow from an immutable reference"),
+                    (eloc, "Invalid mutable borrow from an immutable reference"),
                     (lhs_borrow.ty.loc, "Immutable because of this position"),
                 ])
             }
             let e_ = TE::Borrow(mut_, Box::new(lhs_borrow), field);
-            let ty = Type_::single(sp(loc, SingleType_::Ref(mut_, *field_ty)));
+            let ty = Type_::single(sp(eloc, SingleType_::Ref(mut_, *field_ty)));
             T::exp(ty, sp(loc, e_))
         }
     }
 }
 
-fn exp_dotted_to_owned_value(context: &mut Context, edot: ExpDotted, inner_ty: BaseType) -> T::Exp {
+fn exp_dotted_to_owned_value(
+    context: &mut Context,
+    eloc: Loc,
+    edot: ExpDotted,
+    inner_ty: BaseType,
+) -> T::Exp {
     use T::UnannotatedExp_ as TE;
     match edot {
         sp!(_, ExpDotted_::Exp(lhs)) => *lhs,
@@ -1538,16 +1602,16 @@ fn exp_dotted_to_owned_value(context: &mut Context, edot: ExpDotted, inner_ty: B
                 sp!(_, ExpDotted_::TmpBorrow(_, _)) => panic!("ICE why is this here?"),
                 sp!(_, ExpDotted_::Dot(_, name, _)) => name.clone(),
             };
-            let eborrow = exp_dotted_to_borrow(context, false, edot);
-            let loc = eborrow.exp.loc;
+            let eborrow = exp_dotted_to_borrow(context, eloc, false, edot);
             context.add_implicit_copyable_constraint(
-                loc,
-                format!("Invalid implicit copy of field '{}'. Try adding '*&' to the front of the field access", name),
+                eloc,
+                format!("Invalid implicit copy of field '{}'.", name),
                 inner_ty.clone(),
+                "Try adding '*&' to the front of the field access",
             );
             T::exp(
                 Type_::base(inner_ty),
-                sp(loc, TE::Dereference(Box::new(eborrow))),
+                sp(eloc, TE::Dereference(Box::new(eborrow))),
             )
         }
     }
@@ -1602,9 +1666,9 @@ fn method_call(
                 },
                 edotted => edotted,
             };
-            exp_dotted_to_borrow(context, *mut_, edotted)
+            exp_dotted_to_borrow(context, loc, *mut_, edotted)
         }
-        SingleType_::Base(_) => exp_dotted_to_owned_value(context, edotted, edotted_ty),
+        SingleType_::Base(_) => exp_dotted_to_owned_value(context, loc, edotted, edotted_ty),
     };
     let first_arg_st = match &first_arg.ty {
         sp!(_, Type_::Unit) | sp!(_, Type_::Multiple(_)) => {

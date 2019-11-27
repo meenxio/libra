@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 use chrono::prelude::{SecondsFormat, Utc};
 use client::{client_proxy::ClientProxy, commands::*};
 use libra_logger::set_default_global_logger;
@@ -16,7 +18,7 @@ use structopt::StructOpt;
 )]
 struct Args {
     /// Admission Control port to connect to.
-    #[structopt(short = "p", long, default_value = "8000")]
+    #[structopt(short = "p", long, default_value = "8001")]
     pub port: NonZeroU16,
     /// Host address/name to connect to.
     #[structopt(short = "a", long)]
@@ -160,8 +162,8 @@ mod tests {
     #[test]
     fn test_args_port() {
         let args = Args::from_iter(&["test", "--host=h", "--validator-set-file=vsf"]);
-        assert_eq!(args.port.get(), 8000);
-        assert_eq!(format!("{}:{}", args.host, args.port.get()), "h:8000");
+        assert_eq!(args.port.get(), 8001);
+        assert_eq!(format!("{}:{}", args.host, args.port.get()), "h:8001");
         let args = Args::from_iter(&[
             "test",
             "--port=65535",

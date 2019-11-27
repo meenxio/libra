@@ -91,12 +91,13 @@ impl<T: Payload> EpochManager<T> {
     /// Create a proposer election handler based on proposers
     fn create_proposer_election(
         &self,
+        epoch: u64,
         validators: &ValidatorVerifier,
     ) -> Box<dyn ProposerElection<T> + Send + Sync> {
         let proposers = validators.get_ordered_account_addresses();
         match self.config.proposer_type {
             ConsensusProposerType::MultipleOrderedProposers => {
-                Box::new(MultiProposer::new(proposers, 2))
+                Box::new(MultiProposer::new(epoch, proposers, 2))
             }
             ConsensusProposerType::RotatingProposer => Box::new(RotatingProposer::new(
                 proposers,
@@ -165,32 +166,28 @@ impl<T: Payload> EpochManager<T> {
     }
 
     pub fn start_new_epoch(&mut self, ledger_info: LedgerInfoWithSignatures) -> EventProcessor<T> {
-        let validators = ledger_info
-            .ledger_info()
-            .next_validator_set()
-            .expect("should have ValidatorSet when start new epoch")
-            .into();
         // make sure storage is on this ledger_info too, it should be no-op if it's already committed
         self.state_computer.sync_to_or_bail(ledger_info.clone());
-        let initial_data = RecoveryData::new(None, vec![], vec![], ledger_info.ledger_info(), None)
-            .expect("should be able to build new epoch RecoveryData");
+        let initial_data = self.storage.start();
         self.epoch = initial_data.epoch();
-        info!(
-            "Start new epoch {} with genesis {}, validators {}",
-            self.epoch,
-            initial_data.root_block(),
-            validators,
-        );
-        self.start_epoch(self.signer.clone(), Arc::new(validators), initial_data)
+        self.start_epoch(self.signer.clone(), initial_data)
     }
 
     pub fn start_epoch(
         &self,
         signer: Arc<ValidatorSigner>,
-        validators: Arc<ValidatorVerifier>,
         initial_data: RecoveryData<T>,
     ) -> EventProcessor<T> {
+        let validators = initial_data.validators();
         counters::EPOCH.set(self.epoch as i64);
+        counters::CURRENT_EPOCH_VALIDATORS.set(validators.len() as i64);
+        counters::CURRENT_EPOCH_QUORUM_SIZE.set(validators.quorum_voting_power() as i64);
+        info!(
+            "Start EventProcessor with epoch {} with genesis {}, validators {}",
+            self.epoch,
+            initial_data.root_block(),
+            validators,
+        );
         let last_vote = initial_data.last_vote();
         let author = signer.author();
         let safety_rules_storage = match &self.config.safety_rules.backend {
@@ -227,7 +224,7 @@ impl<T: Payload> EpochManager<T> {
         let pacemaker =
             self.create_pacemaker(self.time_service.clone(), self.timeout_sender.clone());
 
-        let proposer_election = self.create_proposer_election(&validators);
+        let proposer_election = self.create_proposer_election(self.epoch, &validators);
         let network_sender = NetworkSender::new(
             author,
             self.network_sender.clone(),

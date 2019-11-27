@@ -1,9 +1,10 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 use crate::{aws::Aws, cluster::Cluster};
-use failure::prelude::format_err;
-use retry::{delay::Fixed, retry};
+use failure::prelude::{bail, format_err};
 use rusoto_core::RusotoError;
 use rusoto_ecr::{
     BatchGetImageRequest, DescribeImagesRequest, DescribeImagesResponse, Ecr, Image,
@@ -11,32 +12,54 @@ use rusoto_ecr::{
 };
 use rusoto_ecs::{Ecs, UpdateServiceRequest};
 use slog_scope::{info, warn};
-use std::{thread, time::Duration};
+use std::{env, thread, time::Duration};
+use util::retry;
 
 #[derive(Clone)]
 pub struct DeploymentManager {
     aws: Aws,
     cluster: Cluster,
+    running_tag: String,
 }
 
 const VALIDATOR_IMAGE_REPO: &str = "libra_e2e";
 const CLIENT_IMAGE_REPO: &str = "libra_client";
 const FAUCET_IMAGE_REPO: &str = "libra_faucet";
 pub const SOURCE_TAG: &str = "nightly";
-pub const RUNNING_TAG: &str = "cluster_test";
 pub const TESTED_TAG: &str = "nightly_tested";
 const UPSTREAM_PREFIX: &str = "upstream_";
+const MASTER_PREFIX: &str = "master_";
 
 impl DeploymentManager {
     pub fn new(aws: Aws, cluster: Cluster) -> Self {
-        Self { aws, cluster }
+        let running_tag = env::var("TAG").unwrap_or_else(|_| aws.workplace().to_string());
+        if running_tag == SOURCE_TAG
+            || running_tag == TESTED_TAG
+            || running_tag.starts_with(UPSTREAM_PREFIX)
+            || running_tag.starts_with(MASTER_PREFIX)
+        {
+            panic!(
+                "Cluster test can not deploy if workplace is configured to use {} tag.\
+                 Use custom tag for your workplace to use --deploy",
+                running_tag
+            );
+        }
+        info!("Will use {} tag for deployment", running_tag);
+        Self {
+            aws,
+            cluster,
+            running_tag,
+        }
     }
 
     pub fn latest_hash_changed(&self) -> Option<String> {
-        let hash = self.image_digest_by_tag(SOURCE_TAG);
-        let last_tested = self.image_digest_by_tag(TESTED_TAG);
+        let hash = self
+            .image_digest_by_tag(SOURCE_TAG)
+            .expect("Failed to get image digest for SOURCE_TAG");
+        let last_tested = self
+            .image_digest_by_tag(TESTED_TAG)
+            .expect("Failed to get image digest for TESTED_TAG");
         if hash == last_tested {
-            info!("Last deployed digest matches latest digest we expect, not doing redeploy");
             return None;
         }
         Some(hash)
@@ -50,7 +73,7 @@ impl DeploymentManager {
                 image_digest: Some(hash),
                 image_tag: None,
             },
-            RUNNING_TAG,
+            &self.running_tag,
         )?;
         self.update_all_services()?;
         Ok(())
@@ -77,16 +100,18 @@ impl DeploymentManager {
         Ok(())
     }
 
-    fn image_digest_by_tag(&self, tag: &str) -> String {
+    fn image_digest_by_tag(&self, tag: &str) -> failure::Result<String> {
         let result = self.describe_images(tag);
         let images = result
             .image_details
-            .expect("No image_details in ECR response");
+            .ok_or_else(|| format_err!("No image_details in ECR response"))?;
         if images.len() != 1 {
-            panic!("Ecr returned {} images for libra_e2e:nightly", images.len());
+            bail!("Ecr returned {} images for libra_e2e:nightly", images.len());
         }
         let image = images.into_iter().next().unwrap();
-        image.image_digest.expect("No image_digest")
+        image
+            .image_digest
+            .ok_or_else(|| format_err!("No image_digest"))
     }
 
     fn describe_images(&self, tag: &str) -> DescribeImagesResponse {
@@ -115,7 +140,9 @@ impl DeploymentManager {
     }
 
     pub fn get_tested_upstream_commit(&self) -> failure::Result<String> {
-        let digest = self.image_digest_by_tag(TESTED_TAG);
+        let digest = self
+            .image_digest_by_tag(TESTED_TAG)
+            .map_err(|e| format_err!("Failed to get image digest for {}:{}", TESTED_TAG, e))?;
         let prev_upstream_tag = self.get_upstream_tag(&digest)?;
         Ok(prev_upstream_tag[UPSTREAM_PREFIX.len()..].to_string())
     }
@@ -154,20 +181,24 @@ impl DeploymentManager {
             image_tag: None,
         };
         let images = self.get_images(VALIDATOR_IMAGE_REPO, &image_id)?;
-        for image in images {
-            let image_id = match image.image_id {
+        for image in &images {
+            let image_id = match &image.image_id {
                 Some(image_id) => image_id,
                 None => continue,
             };
-            let tag = match image_id.image_tag {
+            let tag = match &image_id.image_tag {
                 Some(tag) => tag,
                 None => continue,
             };
             if tag.starts_with(UPSTREAM_PREFIX) {
-                return Ok(tag);
+                return Ok(tag.clone());
             }
         }
-        Err(format_err!("Failed to find upstream tag"))
+        Err(format_err!(
+            "Failed to find upstream tag for {}. Images: {:?}",
+            digest,
+            images
+        ))
     }
 
     fn get_images(
@@ -179,7 +210,7 @@ impl DeploymentManager {
         get_request.repository_name = repository.to_string();
         get_request.image_ids = vec![image_id.clone()];
         // Retry upto 10 times, waiting 10 sec between retries
-        let response = retry(Fixed::from_millis(10_000).take(10), || {
+        let response = retry::retry(retry::fixed_retry_strategy(10_000, 10), || {
             self.aws
                 .ecr()
                 .batch_get_image(get_request.clone())
@@ -232,6 +263,14 @@ impl DeploymentManager {
             }
         } else {
             Ok(())
+        }
+    }
+
+    pub fn resolve(&self, hash_or_tag: &str) -> failure::Result<String> {
+        if hash_or_tag.starts_with("sha256:") {
+            Ok(hash_or_tag.to_string())
+        } else {
+            self.image_digest_by_tag(hash_or_tag)
         }
     }
 }

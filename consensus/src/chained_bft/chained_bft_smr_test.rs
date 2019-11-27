@@ -59,7 +59,6 @@ impl SMRNode {
     fn start(
         playground: &mut NetworkPlayground,
         signer: ValidatorSigner,
-        validators: Arc<ValidatorVerifier>,
         smr_id: usize,
         storage: Arc<MockStorage<TestPayload>>,
         initial_data: RecoveryData<TestPayload>,
@@ -67,6 +66,7 @@ impl SMRNode {
         executor_with_reconfig: Option<ValidatorSet>,
         safety_rules_path: PathBuf,
     ) -> Self {
+        let validators = initial_data.validators();
         let author = signer.author();
 
         let (network_reqs_tx, network_reqs_rx) = channel::new_test(8);
@@ -76,7 +76,9 @@ impl SMRNode {
 
         playground.add_node(author, consensus_tx, network_reqs_rx);
         let runtime = runtime::Builder::new()
-            .after_start(with_smr_id(signer.author().short_str()))
+            .threaded_scheduler()
+            .enable_all()
+            .on_thread_start(with_smr_id(signer.author().short_str()))
             .build()
             .expect("Failed to create Tokio runtime!");
 
@@ -97,7 +99,6 @@ impl SMRNode {
         let initial_setup = InitialSetup {
             author,
             signer: signer.clone(),
-            validator: validators.as_ref().clone(),
             network_sender,
             network_events,
         };
@@ -139,12 +140,11 @@ impl SMRNode {
         self.smr.stop();
         let recover_data = self
             .storage
-            .get_recovery_data()
+            .try_start()
             .unwrap_or_else(|e| panic!("fail to restart due to: {}", e));
         Self::start(
             playground,
             self.signer,
-            self.validators,
             self.smr_id + 10,
             self.storage,
             recover_data,
@@ -161,23 +161,21 @@ impl SMRNode {
         proposer_type: ConsensusProposerType,
         executor_with_reconfig: bool,
     ) -> Vec<Self> {
-        let (mut signers, validator_verifier) =
+        let (mut signers, validators) =
             random_validator_verifier(num_nodes, Some(quorum_voting_power), true);
         let validator_set = if executor_with_reconfig {
-            Some((&validator_verifier).into())
+            Some((&validators).into())
         } else {
             None
         };
-        let validators = Arc::new(validator_verifier);
         let mut nodes = vec![];
         for smr_id in 0..num_nodes {
-            let (storage, initial_data) = MockStorage::start_for_testing();
+            let (initial_data, storage) = MockStorage::start_for_testing(validators.clone());
             let safety_rules_path = NamedTempFile::new().unwrap().into_temp_path().to_path_buf();
             OnDiskStorage::default_storage(safety_rules_path.clone());
             nodes.push(Self::start(
                 playground,
                 signers.remove(0),
-                Arc::clone(&validators),
                 smr_id,
                 storage,
                 initial_data,
@@ -205,7 +203,7 @@ fn verify_finality_proof(node: &SMRNode, ledger_info_with_sig: &LedgerInfoWithSi
 /// Should receive a new proposal upon start
 fn basic_start_test() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let nodes = SMRNode::start_num_nodes(2, 2, &mut playground, RotatingProposer, false);
     let genesis = nodes[0]
         .smr
@@ -236,7 +234,7 @@ fn basic_start_test() {
 /// Upon startup, the first proposal is sent, delivered and voted by all the participants.
 fn start_with_proposal_test() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let nodes = SMRNode::start_num_nodes(2, 2, &mut playground, RotatingProposer, false);
 
     block_on(async move {
@@ -274,7 +272,7 @@ fn basic_full_round(
     proposer_type: ConsensusProposerType,
 ) {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let _nodes = SMRNode::start_num_nodes(
         num_nodes,
         quorum_voting_power,
@@ -325,7 +323,7 @@ fn happy_path_with_multi_proposer() {
 #[test]
 fn basic_commit_and_restart() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let mut nodes = SMRNode::start_num_nodes(2, 2, &mut playground, RotatingProposer, false);
     let mut block_ids = vec![];
 
@@ -380,7 +378,7 @@ fn basic_commit_and_restart() {
             .await;
     });
     // create a new playground to avoid polling potential vote messages in previous one.
-    playground = NetworkPlayground::new(runtime.executor());
+    playground = NetworkPlayground::new(runtime.handle().clone());
     nodes = nodes
         .into_iter()
         .map(|node| node.restart(&mut playground))
@@ -424,7 +422,7 @@ fn basic_commit_and_restart() {
 #[test]
 fn basic_block_retrieval() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // This test depends on the fixed proposer on nodes[0]
     let mut nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer, false);
     block_on(async move {
@@ -484,7 +482,7 @@ fn basic_block_retrieval() {
 #[test]
 fn block_retrieval_with_timeout() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     let nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer, false);
     block_on(async move {
         let mut first_proposals = vec![];
@@ -540,7 +538,7 @@ fn block_retrieval_with_timeout() {
 /// have been pruned by the others.
 fn basic_state_sync() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // This test depends on the fixed proposer on nodes[0]
     let mut nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer, false);
     block_on(async move {
@@ -620,7 +618,7 @@ fn basic_state_sync() {
 /// Verify that a node syncs up when receiving a timeout message with a relevant ledger info
 fn state_sync_on_timeout() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // This test depends on the fixed proposer on nodes[0]
     let mut nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer, false);
     block_on(async move {
@@ -672,7 +670,7 @@ fn state_sync_on_timeout() {
 /// then this node sends a sync info, which helps the remote to properly catch up.
 fn sync_info_sent_if_remote_stale() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // This test depends on the fixed proposer on nodes[0]
     // We're going to drop messages from 0 to 2: as a result we expect node 2 to broadcast timeout
     // messages, for which node 1 should respond with sync_info, which should eventually
@@ -729,7 +727,7 @@ fn sync_info_sent_if_remote_stale() {
 /// Verify that a QC can be formed by aggregating the votes piggybacked by TimeoutMsgs
 fn aggregate_timeout_votes() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
 
     // The proposer node[0] sends its proposal to nodes 1 and 2, which cannot respond back,
     // because their messages are dropped.
@@ -801,7 +799,7 @@ fn aggregate_timeout_votes() {
 /// Verify that the NIL blocks formed during timeouts can be used to form commit chains.
 fn chain_with_nil_blocks() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
 
     // The proposer node[0] sends 3 proposals, after that its proposals are dropped and it cannot
     // communicate with nodes 1 and 2. Nodes 1 and 2 should be able to commit the 3 proposal
@@ -844,7 +842,7 @@ fn chain_with_nil_blocks() {
 /// Test secondary proposal processing
 fn secondary_proposers() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
 
     let mut nodes =
         SMRNode::start_num_nodes(3, 2, &mut playground, MultipleOrderedProposers, false);
@@ -892,9 +890,11 @@ fn secondary_proposers() {
 /// Test we can do reconfiguration if execution returns new validator set.
 fn reconfiguration_test() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
 
-    let _nodes = SMRNode::start_num_nodes(3, 2, &mut playground, MultipleOrderedProposers, true);
+    // This quorum size needs to be 2f+1 because we derive the ValidatorVerifier from ValidatorSet at network.rs
+    // which doesn't support specializing quorum power
+    let _nodes = SMRNode::start_num_nodes(4, 3, &mut playground, MultipleOrderedProposers, true);
     block_on(async move {
         // Test we can survive a few epochs
         for _ in 0..10 {

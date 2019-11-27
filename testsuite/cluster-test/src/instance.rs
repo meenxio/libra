@@ -1,7 +1,10 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 use failure::{self, prelude::*};
+use std::collections::HashSet;
 use std::{
     ffi::OsStr,
     fmt,
@@ -51,6 +54,8 @@ impl Instance {
             "-i",
             "/libra_rsa",
             "-oStrictHostKeyChecking=no",
+            "-oConnectTimeout=3",
+            "-oConnectionAttempts=10",
             ssh_dest.as_str(),
         ];
         let mut ssh_cmd = Command::new("timeout");
@@ -84,4 +89,12 @@ impl fmt::Display for Instance {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}({})", self.short_hash, self.ip)
     }
+}
+
+pub fn instancelist_to_set(instances: &[Instance]) -> HashSet<String> {
+    let mut r = HashSet::new();
+    for instance in instances {
+        r.insert(instance.short_hash().clone());
+    }
+    r
 }
